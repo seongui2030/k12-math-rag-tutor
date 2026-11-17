@@ -420,7 +420,7 @@ def process_exam_pair(
     sol_pdf: Path,
     out_dir: Path,
     backend: Literal["gemini", "qwen_local"] = "gemini",
-    gemini_model: str = "gemini-2.5-flash",
+    gemini_model: str = "gemini-3.8-flash",
     qwen_bundle: Optional[Tuple[Any, Any]] = None,
     render_scale: float = 2.0,
 ) -> Path:
