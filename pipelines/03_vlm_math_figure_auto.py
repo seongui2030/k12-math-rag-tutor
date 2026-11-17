@@ -181,11 +181,17 @@ for fn_name in ("call_gemini_vlm", "extract_page_with_gemini", "gemini_extract")
         setattr(base_mod, fn_name, wrapped_call)
         break
 
+import importlib
+import runpy
+
 sys.argv = ["03_vlm_math_figure.py"]
+base_mod = importlib.import_module("pipelines.03_vlm_math_figure")
+
 if hasattr(base_mod, "main") and callable(base_mod.main):
     base_mod.main()
 else:
-    raise RuntimeError("03_vlm_math_figure.py 에 main() 함수가 없습니다.")
+    # 03_vlm_math_figure.py 에 main() 이 없는 경우 모듈 파일을 __main__ 으로 실행
+    runpy.run_path(str(project_root / "pipelines/03_vlm_math_figure.py"), run_name="__main__")
 """
     return [sys.executable, "-c", inline_runner]
 
