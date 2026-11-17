@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.colab_env import get_project_root, get_storage_dirs
 
 def build_faiss_index(docs: list, index_dir: str, embedding_model_name: str = "BAAI/bge-m3") -> None:
