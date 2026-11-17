@@ -122,14 +122,15 @@ def build_base_runner_command(
     실행 직전 raw_dir 을 임시 격리 디렉터리로 구성해 해당 세트만 실행하도록 보장합니다.
     """
     inline_runner = f"""
-import os, sys, time, shutil
+import importlib, os, sys, time, shutil
 from pathlib import Path
 
 project_root = Path({str(project_root)!r})
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-import pipelines.03_vlm_math_figure as base_mod
+base_mod = importlib.import_module("pipelines.03_vlm_math_figure")  
+# import pipelines.03_vlm_math_figure as base_mod
 
 # 모델명 상수/기본값이 있으면 반영
 for attr in ("DEFAULT_GEMINI_MODEL", "GEMINI_MODEL", "MODEL_NAME"):
