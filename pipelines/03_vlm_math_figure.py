@@ -1,8 +1,16 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# 프로젝트 루트(.env) 자동 로드 (로컬 실행 시 적용, Colab에서는 환경변수 우선 유지)
+_env_path = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=_env_path, override=False)
 
 # ==============================================================================
-# 3단계 테스트: 2026_10_hs1_problem.pdf & 2026_10_hs1_solution.pdf
-# - 해설지 1페이지 정답표 추출 및 1~30번 문항별 해설 분할
-# - 문제지/해설지 페이지 PNG 렌더링 및 VLM 기반 수식(LaTeX)·도형 묘사 추출
+# 3단계 파이프라인: 수학 문제지 & 해설지 VLM 구조화 파싱 및 1~30번 병합·정답 검증
+# - 깨지는 PdfReader 텍스트 추출 제거 -> 페이지 PNG 렌더링 + VLM(Structured JSON)
+# - 수식(LaTeX) 변환, 도형 묘사, 해설지 1p 정답표 & 풀이 최종답 교차 검증 일괄 처리
+# - 28개 세트 대량 처리를 위한 Gemini API(Structured Outputs) 및 T4 경량 Qwen 지원
 # ==============================================================================
 
 import gc
@@ -10,185 +18,119 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 
 def configure_hf_cache_env() -> None:
-    """
-    실행 환경(Google Colab vs Windows D: 드라이브 vs 기타 로컬)에 맞춰
-    transformers / huggingface_hub 임포트 전에 캐시 경로를 설정합니다.
-    """
     is_colab_env = (
         Path("/content").exists()
         and ("COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ or Path("/content/drive").exists())
     )
-
     if is_colab_env:
-        # 코랩 환경에서는 /content/hf_cache를 기본으로 사용(필요 시 Drive 여유 공간 활용 가능)
         hf_base = Path("/content/hf_cache")
         hf_base.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("HF_HOME", str(hf_base))
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hf_base / "hub"))
     elif os.name == "nt" and Path("D:/").exists():
-        # Windows 로컬 환경에서 C: 드라이브 용량 부족을 피하기 위해 D: 드라이브 사용
         hf_base = Path("D:/hf_cache")
         hf_base.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("HF_HOME", str(hf_base))
         os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hf_base / "hub"))
 
-    # CUDA 메모리 단편화 완화 옵션
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 configure_hf_cache_env()
 
 from PIL import Image
-from pypdf import PdfReader
+from pydantic import BaseModel, Field
 import pypdfium2 as pdfium
-import torch
-import transformers
-from transformers import AutoProcessor, BitsAndBytesConfig
 
 
 # ------------------------------------------------------------------------------
-# 0. 환경 및 파일 경로 자동 탐색
+# 1. 출력 JSON 스키마 정의 (Pydantic - Gemini Structured Outputs & 검증 공용)
 # ------------------------------------------------------------------------------
-def resolve_paths() -> Tuple[Path, Path, Path, Path]:
-    """로컬/코랩/Drive 환경에서 프로젝트 루트와 두 테스트 PDF 경로를 찾습니다."""
-    candidates_root = [
-        Path.cwd(),
-        Path("/content/k12-math-rag-tutor"),
-        Path("/content/drive/MyDrive/k12-math-rag-tutor"),
-        Path("/content"),
-    ]
-
-    project_root = Path.cwd()
-    for cand in candidates_root:
-        if (cand / "src/colab_env.py").exists() or (cand / "data/raw/ebsi/h1").exists():
-            project_root = cand
-            break
-
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
-
-    prob_candidates = [
-        project_root / "data/raw/ebsi/h1/2026_10_hs1_problem.pdf",
-        Path("/content/2026_10_hs1_problem.pdf"),
-        Path("/content/test_ebsi/2026_10_hs1_problem.pdf"),
-        Path("/content/drive/MyDrive/2026_10_hs1_problem.pdf"),
-    ]
-    sol_candidates = [
-        project_root / "data/raw/ebsi/h1/2026_10_hs1_solution.pdf",
-        Path("/content/2026_10_hs1_solution.pdf"),
-        Path("/content/test_ebsi/2026_10_hs1_solution.pdf"),
-        Path("/content/drive/MyDrive/2026_10_hs1_solution.pdf"),
-    ]
-
-    prob_pdf = next((p for p in prob_candidates if p.exists()), prob_candidates[0])
-    sol_pdf = next((p for p in sol_candidates if p.exists()), sol_candidates[0])
-
-    if Path("/content/drive/MyDrive").exists():
-        out_base = Path("/content/drive/MyDrive/k12_math_rag_data/test_2026_10_hs1")
-    else:
-        out_base = project_root / "data/interim/test_2026_10_hs1"
-
-    out_base.mkdir(parents=True, exist_ok=True)
-    return project_root, prob_pdf, sol_pdf, out_base
+class ProblemItem(BaseModel):
+    question_no: int = Field(description="문항 번호 (1~30)")
+    score: Optional[int] = Field(default=None, description="배점 (2, 3, 4 중 하나, 표기 없으면 null)")
+    question_text: str = Field(description="문항 본문 전체. 모든 수식은 표준 LaTeX($...$ 또는 $$...$$)로 표기")
+    choices: List[str] = Field(default_factory=list, description="객관식 선택지 ①~⑤ 리스트 (단답형이면 빈 리스트)")
+    figure_description: str = Field(default="없음", description="도형, 그래프, 표의 기하학적/수치적 상세 묘사 (없으면 '없음')")
 
 
-# ------------------------------------------------------------------------------
-# 1. 해설지 1페이지 정답표 파싱 및 1~30번 문항별 분할
-# ------------------------------------------------------------------------------
-def extract_pdf_pages_text(pdf_path: Path) -> List[str]:
-    reader = PdfReader(str(pdf_path))
-    return [(page.extract_text() or "") for page in reader.pages]
+class ProblemPageSchema(BaseModel):
+    page: int = Field(description="페이지 번호")
+    items: List[ProblemItem] = Field(default_factory=list, description="해당 페이지에 포함된 문항 리스트")
 
 
-def parse_page1_answers(page1_text: str) -> Dict[int, str]:
-    """
-    해설지 1페이지에서 1~30번 정답을 추출합니다.
-    표 레이아웃 특성상 번호와 정답이 붙어 있거나 줄바꿈으로 나뉜 경우를 함께 처리합니다.
-    """
-    answers: Dict[int, str] = {}
-    if not page1_text.strip():
-        return answers
-
-    joined = re.sub(r"[ \t]+", " ", page1_text)
-    for m in re.finditer(
-        r"(?<!\d)([1-9]|[12]\d|30)\s*[:\.\)]?\s*([1-5]|\d{1,3})\b",
-        joined,
-    ):
-        q_no = int(m.group(1))
-        ans_val = m.group(2).strip()
-        if 1 <= q_no <= 30 and q_no not in answers:
-            answers[q_no] = ans_val
-
-    return answers
+class AnswerTableEntry(BaseModel):
+    question_no: int = Field(description="문항 번호 (1~30)")
+    answer: str = Field(description="정답표에 기재된 정답 (객관식은 '1'~'5', 단답형은 숫자)")
 
 
-def split_solution_questions_1_to_30(pages_text: List[str]) -> Dict[int, str]:
-    """
-    해설지 전체 텍스트에서 '1. [출제의도]' ~ '30. [출제의도]' 단위로 문항별 풀이를 나눕니다.
-    """
-    full_text = "\n".join(
-        f"[PAGE {idx + 1}]\n{txt}" for idx, txt in enumerate(pages_text)
+class SolutionItem(BaseModel):
+    question_no: int = Field(description="문항 번호 (1~30)")
+    intent: str = Field(default="", description="[출제의도] 내용")
+    solution_steps: str = Field(description="단계별 풀이 과정 전체. 모든 수식·분수·행렬·부등식은 표준 LaTeX($...$ 또는 $$...$$)로 표기")
+    final_answer: str = Field(description="풀이 마지막 줄에 도출된 최종 정답 값 (예: '3', '11', '4')")
+
+
+class SolutionPageSchema(BaseModel):
+    page: int = Field(description="페이지 번호")
+    answer_table: List[AnswerTableEntry] = Field(
+        default_factory=list,
+        description="페이지 상단에 전체 정답표가 있는 경우 1~30번 정답 목록 (없으면 빈 리스트)",
     )
-    pattern = re.compile(r"(?m)^([1-9]|[12]\d|30)\.\s*\[출제의도\]")
-    matches = list(pattern.finditer(full_text))
-
-    q_map: Dict[int, str] = {}
-    for idx, match in enumerate(matches):
-        q_no = int(match.group(1))
-        start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(full_text)
-        chunk = full_text[start:end].strip()
-        if 1 <= q_no <= 30:
-            if q_no not in q_map or len(chunk) > len(q_map[q_no]):
-                q_map[q_no] = chunk
-
-    return q_map
-
-
-def run_solution_parsing(sol_pdf: Path, out_dir: Path) -> Dict[str, Any]:
-    pages_text = extract_pdf_pages_text(sol_pdf)
-    p1_answers = parse_page1_answers(pages_text[0] if pages_text else "")
-    q_solutions = split_solution_questions_1_to_30(pages_text)
-
-    structured = {
-        "source_file": sol_pdf.name,
-        "num_pages": len(pages_text),
-        "parsed_page1_answers": {str(k): v for k, v in sorted(p1_answers.items())},
-        "missing_answer_nos": [i for i in range(1, 31) if i not in p1_answers],
-        "missing_solution_nos": [i for i in range(1, 31) if i not in q_solutions],
-        "questions": {},
-    }
-
-    for q_no in range(1, 31):
-        structured["questions"][str(q_no)] = {
-            "question_no": q_no,
-            "answer": p1_answers.get(q_no, ""),
-            "solution": q_solutions.get(q_no, ""),
-        }
-
-    out_json = out_dir / "solution_parsed_test.json"
-    out_json.write_text(json.dumps(structured, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[해설 파싱 완료] {out_json}")
-    print(f"  - 1페이지 추출 정답 수: {len(p1_answers)}/30 (미추출 번호: {structured['missing_answer_nos']})")
-    print(f"  - 분할된 문항 해설 수: {len(q_solutions)}/30 (미추출 번호: {structured['missing_solution_nos']})")
-    return structured
+    items: List[SolutionItem] = Field(default_factory=list, description="해당 페이지에 포함된 문항별 해설 리스트")
 
 
 # ------------------------------------------------------------------------------
-# 2. PDF 페이지 PNG 렌더링
+# 2. 프롬프트 생성기 (수식 LaTeX + 정답 매핑 통합)
+# ------------------------------------------------------------------------------
+def build_structured_prompt(doc_role: Literal["problem", "solution"], page_num: int) -> str:
+    common_rules = (
+        "당신은 대한민국 고등학교 수학 시험지 및 해설지 정밀 파싱 전문가입니다.\n"
+        "이미지에서 시각적으로 보이는 내용만 정확히 읽어 지정된 JSON 형식으로 반환하세요.\n\n"
+        "[수식 및 기호 변환 필수 규칙]\n"
+        "1. 모든 수학 기호, 변수, 숫자식, 분수, 지수, 로그, 루트, 절댓값, 행렬, 연립방정식, 부등호, 그리스 문자는 "
+        "깨짐 없이 반드시 표준 LaTeX($...$ 또는 $$...$$)로 작성하세요.\n"
+        "   - 분수: $\\frac{a}{b}$, 제곱근: $\\sqrt{x}$, 부등호: $\\le$, $\\ge$, $\\neq$\n"
+        "   - 행렬: $\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}$, 연립방정식: $\\begin{cases} ... \\end{cases}$\n"
+        "   - 조합/순열: ${}_n\\mathrm{C}_r$, ${}_n\\mathrm{P}_r$\n"
+        "2. 페이지 상단 머리말('2026학년도 10월 고1 전국연합학력평가', '제2교시', '수학 영역' 등)과 하단 쪽수 번호는 제외하세요.\n"
+        "3. 2단 편집 레이아웃인 경우 왼쪽 단 위에서 아래로 읽은 뒤 오른쪽 단 위에서 아래로 순서대로 추출하세요.\n"
+    )
+
+    if doc_role == "problem":
+        role_rules = (
+            f"\n[현재 문서: 문제지 ({page_num}페이지)]\n"
+            "- 각 문항의 번호(question_no), 배점(score), 본문(question_text), 선택지(choices), 도형·그래프 묘사(figure_description)를 추출하세요.\n"
+            "- 선택지 ①, ②, ③, ④, ⑤ 안의 수식도 모두 LaTeX로 변환하여 리스트에 순서대로 담으세요.\n"
+            "- 도형이나 함수 그래프가 있으면 좌표축, 교점, 점의 이름, 길이·각도 조건을 빠짐없이 서술하세요."
+        )
+    else:
+        role_rules = (
+            f"\n[현재 문서: 해설지 ({page_num}페이지)]\n"
+            "- 1페이지 상단에 '정답' 표(1~30번)가 있으면 표의 행과 열을 정확히 대조하여 answer_table에 1번부터 30번까지 빠짐없이 기록하세요. "
+            "(객관식 원문자 ①,②,③,④,⑤는 각각 '1','2','3','4','5'로 변환)\n"
+            "- 정답표가 없는 페이지라면 answer_table은 빈 리스트([])로 두세요.\n"
+            "- 각 문항의 출제의도(intent), 단계별 풀이(solution_steps), 그리고 풀이 마지막에 도출된 최종 값(final_answer)을 추출하세요."
+        )
+
+    return common_rules + role_rules
+
+
+# ------------------------------------------------------------------------------
+# 3. PDF -> PNG 렌더링
 # ------------------------------------------------------------------------------
 def render_pdf_to_pngs(
     pdf_path: Path,
     img_root: Path,
-    scale: float = 1.6,
+    scale: float = 2.0,
     overwrite: bool = False,
 ) -> List[Path]:
-    """PDF 페이지를 PNG 이미지로 변환하고 저장 경로 리스트를 반환합니다."""
     save_dir = img_root / pdf_path.stem
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -210,47 +152,77 @@ def render_pdf_to_pngs(
 
 
 # ------------------------------------------------------------------------------
-# 3. VLM 로드 및 수식(LaTeX) + 도형 상세 묘사 추출
+# 4-A. 백엔드 1: Gemini API (Structured Outputs - 28개 세트 일괄 처리 추천)
 # ------------------------------------------------------------------------------
-def _resolve_vlm_model_class():
-    """설치된 transformers 버전에 맞는 비전-언어 모델 클래스를 안전하게 찾습니다."""
-    for candidate_name in (
-        "AutoModelForImageTextToText",
-        "Qwen2_5_VLForConditionalGeneration",
-        "AutoModel",
-    ):
-        if hasattr(transformers, candidate_name):
-            cls = getattr(transformers, candidate_name)
-            print(f"[VLM 클래스 선택] transformers.{candidate_name}")
-            return cls
+def extract_page_with_gemini(
+    image_path: Path,
+    doc_role: Literal["problem", "solution"],
+    page_num: int,
+    model_name: str = "gemini-2.5-flash",
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    from google import genai
+    from google.genai import types
 
-    raise RuntimeError(
-        f"지원되는 VLM 모델 클래스를 찾지 못했습니다. (transformers 버전: {transformers.__version__})"
-    )
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("환경변수 GEMINI_API_KEY가 설정되어 있지 않습니다.")
+
+    client = genai.Client(api_key=api_key)
+    schema_cls = ProblemPageSchema if doc_role == "problem" else SolutionPageSchema
+    prompt_text = build_structured_prompt(doc_role, page_num)
+
+    with Image.open(image_path) as img:
+        pil_img = img.convert("RGB")
+
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[pil_img, prompt_text],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema_cls,
+                    temperature=0.0,
+                ),
+            )
+            parsed = json.loads(response.text)
+            parsed["page"] = page_num
+            return parsed
+        except Exception as exc:
+            last_err = exc
+            if attempt < max_retries:
+                time.sleep(2.0 * attempt)
+
+    raise RuntimeError(f"Gemini API 추출 실패 ({image_path.name}): {last_err}")
 
 
-def load_vlm_model(
+# ------------------------------------------------------------------------------
+# 4-B. 백엔드 2: 로컬/Colab Qwen2.5-VL (T4 15GB OOM 방지 경량 설정)
+# ------------------------------------------------------------------------------
+def load_qwen_vlm(
     model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
     min_pixels: int = 256 * 28 * 28,
-    max_pixels: int = 768 * 28 * 28,
+    max_pixels: int = 384 * 28 * 28,  # T4 OOM 방지를 위해 768 -> 384로 축소
 ):
-    """VRAM 사용량을 제어하며 VLM 프로세서와 모델을 로드합니다."""
-    has_cuda = torch.cuda.is_available()
-    print(f"[VLM 초기화] 모델: {model_id} | CUDA 사용 가능: {has_cuda}")
-    if has_cuda:
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        print(
-            f"  - GPU: {torch.cuda.get_device_name(0)} | "
-            f"여유 VRAM: {free_bytes / (1024**3):.2f} GiB / 전체: {total_bytes / (1024**3):.2f} GiB"
-        )
+    import torch
+    import transformers
+    from transformers import AutoProcessor, BitsAndBytesConfig
 
+    has_cuda = torch.cuda.is_available()
     processor = AutoProcessor.from_pretrained(
         model_id,
         min_pixels=min_pixels,
         max_pixels=max_pixels,
         trust_remote_code=True,
     )
-    model_cls = _resolve_vlm_model_class()
+
+    model_cls = None
+    for name in ("AutoModelForImageTextToText", "Qwen2_5_VLForConditionalGeneration", "AutoModel"):
+        if hasattr(transformers, name):
+            model_cls = getattr(transformers, name)
+            break
 
     if has_cuda:
         compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -267,7 +239,6 @@ def load_vlm_model(
             trust_remote_code=True,
         )
     else:
-        print("[안내] 현재 CUDA GPU가 감지되지 않았습니다. CPU 모드로 실행됩니다.")
         model = model_cls.from_pretrained(
             model_id,
             dtype=torch.float32,
@@ -279,94 +250,50 @@ def load_vlm_model(
     return processor, model
 
 
-def build_vlm_prompt(project_root: Path, doc_role: str) -> str:
-    """configs/prompts/vlm_extract.txt가 있으면 읽고, 없으면 기본 프롬프트를 사용합니다."""
-    prompt_file = project_root / "configs/prompts/vlm_extract.txt"
-    if prompt_file.exists():
-        base_prompt = prompt_file.read_text(encoding="utf-8").strip()
-    else:
-        base_prompt = (
-            "이 수학 시험/해설 페이지 이미지의 내용을 빠짐없이 구조화해서 추출하세요.\n"
-            "1. 모든 수식, 분수, 지수, 로그, 적분, 행렬, 부등호, 그리스 문자(α, β, θ 등)는 "
-            "깨짐 없이 정확한 LaTeX($...$ 또는 $$...$$)로 표기하세요.\n"
-            "2. 머리말(제2교시, 수학 영역 등)과 쪽수 번호는 제외하세요.\n"
-            "3. 각 문항별로 문항 번호, 본문(수식 포함), 도형/그래프 상세 묘사(없으면 '없음')를 정리하세요."
-        )
-
-    role_hint = (
-        "현재 문서는 [문제지]입니다. 각 문항의 문제 본문, 선택지/조건, 도형·그래프의 기하학적 구조를 정확히 적으세요."
-        if doc_role == "problem"
-        else "현재 문서는 [해설지]입니다. 상단 정답표(있다면)와 각 문항의 출제의도, 단계별 풀이 수식, 최종 답을 정확히 적으세요."
-    )
-    return f"{role_hint}\n\n{base_prompt}"
-
-
-def extract_math_from_image(
+def extract_page_with_qwen(
     processor,
     model,
     image_path: Path,
-    prompt_text: str,
-    max_new_tokens: int = 1536,
-) -> str:
-    """단일 페이지 이미지에서 수식(LaTeX) 및 도형 묘사를 추출하고 GPU 메모리를 정리합니다."""
+    doc_role: Literal["problem", "solution"],
+    page_num: int,
+    max_new_tokens: int = 1024,  # T4 OOM 방지를 위해 1536 -> 1024로 축소
+) -> Dict[str, Any]:
+    import torch
+
+    schema_cls = ProblemPageSchema if doc_role == "problem" else SolutionPageSchema
+    schema_hint = json.dumps(schema_cls.model_json_schema(), ensure_ascii=False)
+    prompt_text = (
+        f"{build_structured_prompt(doc_role, page_num)}\n\n"
+        f"반드시 아래 JSON Schema를 준수하는 순수 JSON 객체만 출력하세요(마크다운 코드블록 금지):\n{schema_hint}"
+    )
+
     inputs = None
     generated_ids = None
     try:
         with Image.open(image_path) as img:
             image = img.convert("RGB")
 
-        try:
-            from qwen_vl_utils import process_vision_info  # type: ignore
-
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": str(image_path)},
-                        {"type": "text", "text": prompt_text},
-                    ],
-                }
-            ]
-            chat_text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            image_inputs, video_inputs = process_vision_info(messages)
-            inputs = processor(
-                text=[chat_text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            )
-        except ImportError:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": prompt_text},
-                    ],
-                }
-            ]
-            if hasattr(processor, "apply_chat_template"):
-                chat_text = processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-            else:
-                chat_text = prompt_text
-
-            inputs = processor(
-                text=[chat_text],
-                images=[image],
-                padding=True,
-                return_tensors="pt",
-            )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+        chat_text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = processor(
+            text=[chat_text],
+            images=[image],
+            padding=True,
+            return_tensors="pt",
+        )
 
         target_device = next(model.parameters()).device
-        inputs = {
-            k: (v.to(target_device) if hasattr(v, "to") else v)
-            for k, v in inputs.items()
-        }
+        inputs = {k: (v.to(target_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
         with torch.inference_mode():
             generated_ids = model.generate(
@@ -377,8 +304,13 @@ def extract_math_from_image(
 
         input_len = inputs["input_ids"].shape[1]
         trimmed_ids = [out_ids[input_len:] for out_ids in generated_ids]
-        decoded = processor.batch_decode(trimmed_ids, skip_special_tokens=True)[0]
-        return decoded.strip()
+        raw_out = processor.batch_decode(trimmed_ids, skip_special_tokens=True)[0].strip()
+
+        # 코드블록 제거 후 JSON 파싱
+        raw_out = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_out).strip()
+        parsed = json.loads(raw_out)
+        parsed["page"] = page_num
+        return parsed
     finally:
         del inputs, generated_ids
         gc.collect()
@@ -386,98 +318,181 @@ def extract_math_from_image(
             torch.cuda.empty_cache()
 
 
-def run_two_file_vlm_test(
+# ------------------------------------------------------------------------------
+# 5. 문제지 + 해설지 병합 및 정답표-풀이 최종답 교차 검증
+# ------------------------------------------------------------------------------
+def _normalize_answer_str(val: str) -> str:
+    """원문자(①~⑤) 및 공백/$ 기호를 정규화하여 비교 가능하게 만듭니다."""
+    circle_map = {"①": "1", "②": "2", "③": "3", "④": "4", "⑤": "5"}
+    s = str(val or "").strip().replace("$", "").strip()
+    for k, v in circle_map.items():
+        s = s.replace(k, v)
+    return s
+
+
+def merge_problem_and_solution(
+    exam_id: str,
+    prob_pages_data: Dict[str, Any],
+    sol_pages_data: Dict[str, Any],
+    out_path: Path,
+) -> Dict[str, Any]:
+    problems_by_no: Dict[int, Dict[str, Any]] = {}
+    for p_info in prob_pages_data.get("pages", {}).values():
+        if p_info.get("status") != "ok":
+            continue
+        for item in p_info.get("data", {}).get("items", []):
+            q_no = int(item["question_no"])
+            problems_by_no[q_no] = item
+
+    answer_table_map: Dict[int, str] = {}
+    solutions_by_no: Dict[int, Dict[str, Any]] = {}
+    for p_info in sol_pages_data.get("pages", {}).values():
+        if p_info.get("status") != "ok":
+            continue
+        page_data = p_info.get("data", {})
+        for entry in page_data.get("answer_table", []):
+            q_no = int(entry["question_no"])
+            if 1 <= q_no <= 30 and entry.get("answer"):
+                answer_table_map[q_no] = _normalize_answer_str(entry["answer"])
+        for item in page_data.get("items", []):
+            q_no = int(item["question_no"])
+            # 여러 페이지에 걸친 문항일 경우 풀이 텍스트를 이어 붙임
+            if q_no in solutions_by_no:
+                solutions_by_no[q_no]["solution_steps"] += "\n" + item.get("solution_steps", "")
+                if item.get("final_answer"):
+                    solutions_by_no[q_no]["final_answer"] = item["final_answer"]
+            else:
+                solutions_by_no[q_no] = item
+
+    merged_questions: Dict[str, Any] = {}
+    mismatch_nos: List[int] = []
+
+    for q_no in range(1, 31):
+        p_item = problems_by_no.get(q_no, {})
+        s_item = solutions_by_no.get(q_no, {})
+
+        table_ans = answer_table_map.get(q_no, "")
+        sol_final_ans = _normalize_answer_str(s_item.get("final_answer", ""))
+        final_ans = table_ans or sol_final_ans
+
+        is_verified = bool(table_ans and sol_final_ans and (table_ans == sol_final_ans))
+        if table_ans and sol_final_ans and not is_verified:
+            mismatch_nos.append(q_no)
+
+        merged_questions[str(q_no)] = {
+            "exam_id": exam_id,
+            "question_no": q_no,
+            "score": p_item.get("score"),
+            "question_text": p_item.get("question_text", ""),
+            "choices": p_item.get("choices", []),
+            "figure_description": p_item.get("figure_description", "없음"),
+            "answer": final_ans,
+            "answer_from_table": table_ans,
+            "answer_from_solution": sol_final_ans,
+            "answer_verified": is_verified,
+            "intent": s_item.get("intent", ""),
+            "solution": s_item.get("solution_steps", ""),
+        }
+
+    result = {
+        "exam_id": exam_id,
+        "total_questions": 30,
+        "parsed_problem_count": len(problems_by_no),
+        "parsed_solution_count": len(solutions_by_no),
+        "parsed_answer_table_count": len(answer_table_map),
+        "answer_mismatch_nos": mismatch_nos,
+        "questions": merged_questions,
+    }
+
+    out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n[통합 완료] {out_path}")
+    print(f"  - 문제 추출: {len(problems_by_no)}/30 | 해설 추출: {len(solutions_by_no)}/30 | 정답표: {len(answer_table_map)}/30")
+    print(f"  - 정답 불일치 의심 문항: {mismatch_nos}")
+    return result
+
+
+# ------------------------------------------------------------------------------
+# 6. 단일 시험 세트(문제지 + 해설지) 실행 파이프라인 (28개 배치 루프에서 호출)
+# ------------------------------------------------------------------------------
+def process_exam_pair(
+    exam_id: str,
     prob_pdf: Path,
     sol_pdf: Path,
     out_dir: Path,
-    project_root: Path,
-    vlm_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
-    max_pages_per_file: Optional[int] = None,
-    specific_pages: Optional[Dict[str, List[int]]] = None,
-    render_scale: float = 1.6,
-    overwrite_pngs: bool = True,
-    max_new_tokens: int = 1536,
-) -> Dict[str, Any]:
-    """
-    두 PDF 파일을 대상으로 렌더링 및 VLM 파싱을 수행하고 페이지마다 즉시 저장합니다.
-    """
-    img_root = out_dir / "page_images"
-    vlm_root = out_dir / "vlm_parsed"
+    backend: Literal["gemini", "qwen_local"] = "gemini",
+    gemini_model: str = "gemini-2.5-flash",
+    qwen_bundle: Optional[Tuple[Any, Any]] = None,
+    render_scale: float = 2.0,
+) -> Path:
+    exam_out_dir = out_dir / exam_id
+    img_root = exam_out_dir / "page_images"
+    vlm_root = exam_out_dir / "vlm_parsed"
     vlm_root.mkdir(parents=True, exist_ok=True)
 
-    targets = [
-        ("problem", prob_pdf),
-        ("solution", sol_pdf),
-    ]
+    role_results: Dict[str, Any] = {}
 
-    processor, model = load_vlm_model(vlm_model_id)
-    summary: Dict[str, Any] = {}
-
-    for role, pdf_path in targets:
+    for role, pdf_path in [("problem", prob_pdf), ("solution", sol_pdf)]:
         if not pdf_path.exists():
-            print(f"[경고] 파일이 없어 건너뜁니다: {pdf_path}")
-            continue
+            raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {pdf_path}")
 
-        rendered_imgs = render_pdf_to_pngs(
-            pdf_path,
-            img_root=img_root,
-            scale=render_scale,
-            overwrite=overwrite_pngs,
-        )
-        selected_imgs = rendered_imgs
+        rendered_imgs = render_pdf_to_pngs(pdf_path, img_root=img_root, scale=render_scale, overwrite=False)
+        out_json_path = vlm_root / f"{pdf_path.stem}_structured.json"
 
-        if specific_pages and role in specific_pages:
-            wanted_set = set(specific_pages[role])
-            selected_imgs = [
-                p for idx, p in enumerate(rendered_imgs, start=1) if idx in wanted_set
-            ]
-        elif max_pages_per_file is not None:
-            selected_imgs = rendered_imgs[:max_pages_per_file]
-
-        out_json_path = vlm_root / f"{pdf_path.stem}_vlm.json"
         if out_json_path.exists():
             existing_data = json.loads(out_json_path.read_text(encoding="utf-8"))
         else:
             existing_data = {
+                "exam_id": exam_id,
                 "source_file": pdf_path.name,
                 "role": role,
                 "total_pages": len(rendered_imgs),
                 "pages": {},
             }
 
-        prompt_text = build_vlm_prompt(project_root, role)
-        print(f"\n[{role.upper()}] {pdf_path.name} -> 대상 {len(selected_imgs)}페이지 VLM 추출 시작")
+        print(f"[{exam_id} | {role.upper()}] 총 {len(rendered_imgs)}페이지 파싱 시작 (backend={backend})")
 
-        for img_path in selected_imgs:
+        for img_path in rendered_imgs:
             page_num = int(re.search(r"page_(\d+)\.png", img_path.name).group(1))
             page_key = str(page_num)
 
-            prev_entry = existing_data["pages"].get(page_key, {})
-            if prev_entry.get("status") == "ok" and prev_entry.get("vlm_text"):
+            prev = existing_data["pages"].get(page_key, {})
+            if prev.get("status") == "ok" and prev.get("data"):
                 print(f"  - {page_num}페이지: 기존 정상 결과 있음 (스킵)")
                 continue
 
             try:
-                vlm_text = extract_math_from_image(
-                    processor=processor,
-                    model=model,
-                    image_path=img_path,
-                    prompt_text=prompt_text,
-                    max_new_tokens=max_new_tokens,
-                )
+                if backend == "gemini":
+                    structured_page = extract_page_with_gemini(
+                        image_path=img_path,
+                        doc_role=role,  # type: ignore
+                        page_num=page_num,
+                        model_name=gemini_model,
+                    )
+                else:
+                    if qwen_bundle is None:
+                        raise ValueError("qwen_local 모드에서는 load_qwen_vlm() 결과를 전달해야 합니다.")
+                    processor, model = qwen_bundle
+                    structured_page = extract_page_with_qwen(
+                        processor=processor,
+                        model=model,
+                        image_path=img_path,
+                        doc_role=role,  # type: ignore
+                        page_num=page_num,
+                    )
+
                 existing_data["pages"][page_key] = {
                     "page": page_num,
                     "image_path": str(img_path),
-                    "vlm_text": vlm_text,
                     "status": "ok",
+                    "data": structured_page,
                 }
-                print(f"  - {page_num}페이지: 추출 완료 ({len(vlm_text)}자)")
+                print(f"  - {page_num}페이지: 구조화 완료 (문항 {len(structured_page.get('items', []))}개)")
             except Exception as exc:
                 existing_data["pages"][page_key] = {
                     "page": page_num,
                     "image_path": str(img_path),
-                    "vlm_text": "",
                     "status": f"error: {type(exc).__name__}: {exc}",
+                    "data": {},
                 }
                 print(f"  - {page_num}페이지: 오류 발생 -> {exc}")
 
@@ -486,49 +501,67 @@ def run_two_file_vlm_test(
                 encoding="utf-8",
             )
 
-        summary[role] = str(out_json_path)
+        role_results[role] = existing_data
 
-    return summary
+    merged_path = exam_out_dir / f"{exam_id}_merged.json"
+    merge_problem_and_solution(
+        exam_id=exam_id,
+        prob_pages_data=role_results["problem"],
+        sol_pages_data=role_results["solution"],
+        out_path=merged_path,
+    )
+    return merged_path
 
 
 # ------------------------------------------------------------------------------
-# 4. 실행 진입점
+# 7. 28개 세트 일괄 배치 실행 예시
 # ------------------------------------------------------------------------------
-if __name__ == "__main__":
-    project_root, prob_pdf, sol_pdf, out_dir = resolve_paths()
-    print("프로젝트 루트:", project_root)
-    print("문제지 경로:", prob_pdf, "| 존재:", prob_pdf.exists())
-    print("해설지 경로:", sol_pdf, "| 존재:", sol_pdf.exists())
-    print("결과 저장 폴더:", out_dir)
+def run_batch_all_exams(
+    raw_dir: Path,
+    out_dir: Path,
+    backend: Literal["gemini", "qwen_local"] = "gemini",
+) -> None:
+    """
+    raw_dir 내의 *_problem.pdf 와 *_solution.pdf 쌍을 자동으로 찾아 일괄 처리합니다.
+    """
+    prob_files = sorted(raw_dir.glob("*_problem.pdf"))
+    print(f"탐색된 시험지 세트 수: {len(prob_files)}개")
 
-    if sol_pdf.exists():
-        sol_parsed = run_solution_parsing(sol_pdf, out_dir)
-        print("\n[샘플 확인 - 1페이지 정답 1~10번]:")
-        for i in range(1, 11):
-            print(f"  {i}번: {sol_parsed['parsed_page1_answers'].get(str(i), '(미추출)')}")
-    else:
-        print("\n[안내] 해설지 PDF가 아직 없습니다. 경로를 확인해 주세요.")
+    qwen_bundle = load_qwen_vlm() if backend == "qwen_local" else None
 
-    if prob_pdf.exists() or sol_pdf.exists():
-        vlm_outputs = run_two_file_vlm_test(
+    for prob_pdf in prob_files:
+        exam_id = prob_pdf.name.replace("_problem.pdf", "")
+        sol_pdf = raw_dir / f"{exam_id}_solution.pdf"
+        if not sol_pdf.exists():
+            print(f"[건너뜀] 해설지 없음: {sol_pdf.name}")
+            continue
+
+        process_exam_pair(
+            exam_id=exam_id,
             prob_pdf=prob_pdf,
             sol_pdf=sol_pdf,
             out_dir=out_dir,
-            project_root=project_root,
-            vlm_model_id="Qwen/Qwen2.5-VL-7B-Instruct",
-            max_pages_per_file=None,
-            specific_pages={
-                "problem": [1, 8],
-                "solution": [1, 3],
-            },
-            render_scale=1.6,
-            overwrite_pngs=True,
-            max_new_tokens=1536,
+            backend=backend,
+            qwen_bundle=qwen_bundle,
         )
-        print("\n[VLM 테스트 저장 파일 목록]:", vlm_outputs)
 
-        for role, json_p in vlm_outputs.items():
-            data = json.loads(Path(json_p).read_text(encoding="utf-8"))
-            for p_key, p_info in sorted(data.get("pages", {}).items(), key=lambda x: int(x[0])):
-                print(f"\n=== [{role.upper()}] {p_key}페이지 미리보기 ({p_info.get('status')}) ===")
-                print(p_info.get("vlm_text", "")[:700])
+
+if __name__ == "__main__":
+    project_root = Path("/content/k12-math-rag-tutor") if Path("/content/k12-math-rag-tutor").exists() else Path.cwd()
+    raw_ebsi_dir = project_root / "data/raw/ebsi/h1"
+    out_base_dir = (
+        Path("/content/drive/MyDrive/k12_math_rag_data/structured_exams")
+        if Path("/content/drive/MyDrive").exists()
+        else project_root / "data/processed/structured_exams"
+    )
+    out_base_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Colab에서 실행 전 패키지 설치 및 API 키 설정:
+    #    !pip install -q google-genai pydantic pypdfium2 pillow
+    #    os.environ["GEMINI_API_KEY"] = "여기에_API_키_입력"
+    # 2) raw_ebsi_dir 안의 28개(*_problem.pdf, *_solution.pdf) 전체 일괄 실행:
+    run_batch_all_exams(
+        raw_dir=raw_ebsi_dir,
+        out_dir=out_base_dir,
+        backend="gemini",  # 로컬 GPU로 1개씩 테스트할 때만 "qwen_local" 사용
+    )
