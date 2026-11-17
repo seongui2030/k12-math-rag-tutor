@@ -158,7 +158,7 @@ def extract_page_with_gemini(
     image_path: Path,
     doc_role: Literal["problem", "solution"],
     page_num: int,
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = "gemini-3.8-flash",
     max_retries: int = 3,
 ) -> Dict[str, Any]:
     from google import genai
