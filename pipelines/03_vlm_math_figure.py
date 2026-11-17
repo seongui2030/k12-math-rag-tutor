@@ -1,27 +1,47 @@
+
 # ==============================================================================
 # 3단계 테스트: 2026_10_hs1_problem.pdf & 2026_10_hs1_solution.pdf
 # - 해설지 1페이지 정답표 추출 및 1~30번 문항별 해설 분할
 # - 문제지/해설지 페이지 PNG 렌더링 및 VLM 기반 수식(LaTeX)·도형 묘사 추출
 # ==============================================================================
 
-# 방법 A: Hugging Face 캐시 경로를 D: 드라이브로 변경 (추천)
-# Python 코드 상단(import torch, import transformers 이전)에 환경변수를 지정하면, C:\Users\WJ\.cache\huggingface 대신 D: 드라이브에 모델 캐시를 저장합니다.
-
-import os
-
-# 반드시 transformers / huggingface_hub 임포트 전에 설정해야 합니다.
-os.environ["HF_HOME"] = "D:/hf_cache"
-os.environ["HUGGINGFACE_HUB_CACHE"] = "D:/hf_cache/hub"
-
-# [선택] 코랩 최초 실행 시 주석 해제 후 설치
-# !pip install -q pypdf pypdfium2 pillow torch transformers accelerate bitsandbytes qwen-vl-utils
-
+import gc
 import json
 import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def configure_hf_cache_env() -> None:
+    """
+    실행 환경(Google Colab vs Windows D: 드라이브 vs 기타 로컬)에 맞춰
+    transformers / huggingface_hub 임포트 전에 캐시 경로를 설정합니다.
+    """
+    is_colab_env = (
+        Path("/content").exists()
+        and ("COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ or Path("/content/drive").exists())
+    )
+
+    if is_colab_env:
+        # 코랩 환경에서는 /content/hf_cache를 기본으로 사용(필요 시 Drive 여유 공간 활용 가능)
+        hf_base = Path("/content/hf_cache")
+        hf_base.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_HOME", str(hf_base))
+        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hf_base / "hub"))
+    elif os.name == "nt" and Path("D:/").exists():
+        # Windows 로컬 환경에서 C: 드라이브 용량 부족을 피하기 위해 D: 드라이브 사용
+        hf_base = Path("D:/hf_cache")
+        hf_base.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_HOME", str(hf_base))
+        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hf_base / "hub"))
+
+    # CUDA 메모리 단편화 완화 옵션
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+configure_hf_cache_env()
 
 from PIL import Image
 from pypdf import PdfReader
@@ -52,7 +72,6 @@ def resolve_paths() -> Tuple[Path, Path, Path, Path]:
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-    # 가능한 PDF 위치 후보들
     prob_candidates = [
         project_root / "data/raw/ebsi/h1/2026_10_hs1_problem.pdf",
         Path("/content/2026_10_hs1_problem.pdf"),
@@ -69,7 +88,6 @@ def resolve_paths() -> Tuple[Path, Path, Path, Path]:
     prob_pdf = next((p for p in prob_candidates if p.exists()), prob_candidates[0])
     sol_pdf = next((p for p in sol_candidates if p.exists()), sol_candidates[0])
 
-    # 출력 디렉터리 (Drive가 마운트되어 있으면 Drive에 저장, 아니면 로컬/코랩 data/interim 하위에 저장)
     if Path("/content/drive/MyDrive").exists():
         out_base = Path("/content/drive/MyDrive/k12_math_rag_data/test_2026_10_hs1")
     else:
@@ -96,7 +114,6 @@ def parse_page1_answers(page1_text: str) -> Dict[int, str]:
     if not page1_text.strip():
         return answers
 
-    # 1) '1 3', '1. 3', '1) 3', '1: 3' 형태 매칭
     joined = re.sub(r"[ \t]+", " ", page1_text)
     for m in re.finditer(
         r"(?<!\d)([1-9]|[12]\d|30)\s*[:\.\)]?\s*([1-5]|\d{1,3})\b",
@@ -165,7 +182,12 @@ def run_solution_parsing(sol_pdf: Path, out_dir: Path) -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 # 2. PDF 페이지 PNG 렌더링
 # ------------------------------------------------------------------------------
-def render_pdf_to_pngs(pdf_path: Path, img_root: Path, scale: float = 2.2) -> List[Path]:
+def render_pdf_to_pngs(
+    pdf_path: Path,
+    img_root: Path,
+    scale: float = 1.6,
+    overwrite: bool = False,
+) -> List[Path]:
     """PDF 페이지를 PNG 이미지로 변환하고 저장 경로 리스트를 반환합니다."""
     save_dir = img_root / pdf_path.stem
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -175,7 +197,7 @@ def render_pdf_to_pngs(pdf_path: Path, img_root: Path, scale: float = 2.2) -> Li
     try:
         for page_idx in range(len(pdf_doc)):
             out_png = save_dir / f"page_{page_idx + 1:02d}.png"
-            if not out_png.exists():
+            if overwrite or not out_png.exists():
                 page = pdf_doc[page_idx]
                 bitmap = page.render(scale=scale)
                 pil_img = bitmap.to_pil()
@@ -190,29 +212,45 @@ def render_pdf_to_pngs(pdf_path: Path, img_root: Path, scale: float = 2.2) -> Li
 # ------------------------------------------------------------------------------
 # 3. VLM 로드 및 수식(LaTeX) + 도형 상세 묘사 추출
 # ------------------------------------------------------------------------------
-def load_vlm_model(model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"):
-    """현재 설치된 transformers 버전에 맞춰 VLM 클래스를 안전하게 선택해 로드합니다."""
-    has_cuda = torch.cuda.is_available()
-    print(f"[VLM 초기화] 모델: {model_id} | CUDA 사용 가능: {has_cuda}")
-
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-
-    # 현재 transformers 버전에 존재하는 모델 클래스를 순서대로 탐색
-    model_cls = None
+def _resolve_vlm_model_class():
+    """설치된 transformers 버전에 맞는 비전-언어 모델 클래스를 안전하게 찾습니다."""
     for candidate_name in (
         "AutoModelForImageTextToText",
         "Qwen2_5_VLForConditionalGeneration",
         "AutoModel",
     ):
         if hasattr(transformers, candidate_name):
-            model_cls = getattr(transformers, candidate_name)
+            cls = getattr(transformers, candidate_name)
             print(f"[VLM 클래스 선택] transformers.{candidate_name}")
-            break
+            return cls
 
-    if model_cls is None:
-        raise RuntimeError(
-            f"지원되는 VLM 클래스를 찾지 못했습니다. (transformers 버전: {transformers.__version__})"
+    raise RuntimeError(
+        f"지원되는 VLM 모델 클래스를 찾지 못했습니다. (transformers 버전: {transformers.__version__})"
+    )
+
+
+def load_vlm_model(
+    model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+    min_pixels: int = 256 * 28 * 28,
+    max_pixels: int = 768 * 28 * 28,
+):
+    """VRAM 사용량을 제어하며 VLM 프로세서와 모델을 로드합니다."""
+    has_cuda = torch.cuda.is_available()
+    print(f"[VLM 초기화] 모델: {model_id} | CUDA 사용 가능: {has_cuda}")
+    if has_cuda:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        print(
+            f"  - GPU: {torch.cuda.get_device_name(0)} | "
+            f"여유 VRAM: {free_bytes / (1024**3):.2f} GiB / 전체: {total_bytes / (1024**3):.2f} GiB"
         )
+
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        trust_remote_code=True,
+    )
+    model_cls = _resolve_vlm_model_class()
 
     if has_cuda:
         compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -229,7 +267,7 @@ def load_vlm_model(model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"):
             trust_remote_code=True,
         )
     else:
-        print("[안내] 현재 GPU(CUDA)가 비활성화되어 있습니다. CPU 실행은 느릴 수 있으므로 코랩 GPU 연결을 권장합니다.")
+        print("[안내] 현재 CUDA GPU가 감지되지 않았습니다. CPU 모드로 실행됩니다.")
         model = model_cls.from_pretrained(
             model_id,
             dtype=torch.float32,
@@ -268,74 +306,84 @@ def extract_math_from_image(
     model,
     image_path: Path,
     prompt_text: str,
-    max_new_tokens: int = 2048,
+    max_new_tokens: int = 1536,
 ) -> str:
-    """단일 페이지 이미지에서 수식(LaTeX) 및 도형 묘사를 추출합니다."""
-    with Image.open(image_path) as img:
-        image = img.convert("RGB")
-
-    # qwen_vl_utils가 설치되어 있으면 공식 메시지 포맷 사용, 아니면 표준 이미지 메시지 포맷 사용
+    """단일 페이지 이미지에서 수식(LaTeX) 및 도형 묘사를 추출하고 GPU 메모리를 정리합니다."""
+    inputs = None
+    generated_ids = None
     try:
-        from qwen_vl_utils import process_vision_info  # type: ignore
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": str(image_path)},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }
-        ]
-        chat_text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = processor(
-            text=[chat_text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-    except ImportError:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }
-        ]
-        if hasattr(processor, "apply_chat_template"):
+        try:
+            from qwen_vl_utils import process_vision_info  # type: ignore
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": str(image_path)},
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }
+            ]
             chat_text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
-        else:
-            chat_text = prompt_text
+            image_inputs, video_inputs = process_vision_info(messages)
+            inputs = processor(
+                text=[chat_text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+        except ImportError:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }
+            ]
+            if hasattr(processor, "apply_chat_template"):
+                chat_text = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                chat_text = prompt_text
 
-        inputs = processor(
-            text=[chat_text],
-            images=[image],
-            padding=True,
-            return_tensors="pt",
-        )
+            inputs = processor(
+                text=[chat_text],
+                images=[image],
+                padding=True,
+                return_tensors="pt",
+            )
 
-    target_device = next(model.parameters()).device
-    inputs = {k: (v.to(target_device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+        target_device = next(model.parameters()).device
+        inputs = {
+            k: (v.to(target_device) if hasattr(v, "to") else v)
+            for k, v in inputs.items()
+        }
 
-    with torch.inference_mode():
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
+        with torch.inference_mode():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
 
-    input_len = inputs["input_ids"].shape[1]
-    trimmed_ids = [out_ids[input_len:] for out_ids in generated_ids]
-    decoded = processor.batch_decode(trimmed_ids, skip_special_tokens=True)[0]
-    return decoded.strip()
+        input_len = inputs["input_ids"].shape[1]
+        trimmed_ids = [out_ids[input_len:] for out_ids in generated_ids]
+        decoded = processor.batch_decode(trimmed_ids, skip_special_tokens=True)[0]
+        return decoded.strip()
+    finally:
+        del inputs, generated_ids
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def run_two_file_vlm_test(
@@ -346,11 +394,12 @@ def run_two_file_vlm_test(
     vlm_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
     max_pages_per_file: Optional[int] = None,
     specific_pages: Optional[Dict[str, List[int]]] = None,
+    render_scale: float = 1.6,
+    overwrite_pngs: bool = True,
+    max_new_tokens: int = 1536,
 ) -> Dict[str, Any]:
     """
     두 PDF 파일을 대상으로 렌더링 및 VLM 파싱을 수행하고 페이지마다 즉시 저장합니다.
-    - max_pages_per_file: 예) 2를 넣으면 각 파일 앞 2페이지만 빠르게 테스트
-    - specific_pages: 예) {"problem": [1, 8], "solution": [1, 2]} 처럼 특정 페이지만 지정 가능
     """
     img_root = out_dir / "page_images"
     vlm_root = out_dir / "vlm_parsed"
@@ -369,7 +418,12 @@ def run_two_file_vlm_test(
             print(f"[경고] 파일이 없어 건너뜁니다: {pdf_path}")
             continue
 
-        rendered_imgs = render_pdf_to_pngs(pdf_path, img_root=img_root, scale=2.2)
+        rendered_imgs = render_pdf_to_pngs(
+            pdf_path,
+            img_root=img_root,
+            scale=render_scale,
+            overwrite=overwrite_pngs,
+        )
         selected_imgs = rendered_imgs
 
         if specific_pages and role in specific_pages:
@@ -395,12 +449,12 @@ def run_two_file_vlm_test(
         print(f"\n[{role.upper()}] {pdf_path.name} -> 대상 {len(selected_imgs)}페이지 VLM 추출 시작")
 
         for img_path in selected_imgs:
-            # 파일명 page_08.png -> 8
             page_num = int(re.search(r"page_(\d+)\.png", img_path.name).group(1))
             page_key = str(page_num)
 
-            if page_key in existing_data["pages"] and existing_data["pages"][page_key].get("vlm_text"):
-                print(f"  - {page_num}페이지: 기존 결과 있음 (스킵)")
+            prev_entry = existing_data["pages"].get(page_key, {})
+            if prev_entry.get("status") == "ok" and prev_entry.get("vlm_text"):
+                print(f"  - {page_num}페이지: 기존 정상 결과 있음 (스킵)")
                 continue
 
             try:
@@ -409,7 +463,7 @@ def run_two_file_vlm_test(
                     model=model,
                     image_path=img_path,
                     prompt_text=prompt_text,
-                    max_new_tokens=2048,
+                    max_new_tokens=max_new_tokens,
                 )
                 existing_data["pages"][page_key] = {
                     "page": page_num,
@@ -427,7 +481,6 @@ def run_two_file_vlm_test(
                 }
                 print(f"  - {page_num}페이지: 오류 발생 -> {exc}")
 
-            # 페이지마다 즉시 저장해 중간 중단 시에도 결과 보존
             out_json_path.write_text(
                 json.dumps(existing_data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -448,7 +501,6 @@ if __name__ == "__main__":
     print("해설지 경로:", sol_pdf, "| 존재:", sol_pdf.exists())
     print("결과 저장 폴더:", out_dir)
 
-    # (A) 먼저 해설지 1페이지 정답표 및 1~30번 문항 분할 테스트
     if sol_pdf.exists():
         sol_parsed = run_solution_parsing(sol_pdf, out_dir)
         print("\n[샘플 확인 - 1페이지 정답 1~10번]:")
@@ -457,9 +509,6 @@ if __name__ == "__main__":
     else:
         print("\n[안내] 해설지 PDF가 아직 없습니다. 경로를 확인해 주세요.")
 
-    # (B) VLM 수식·도형 추출 테스트
-    # 처음엔 핵심 페이지(문제지 1p, 8p 도형문항 / 해설지 1p 정답표, 3p 도형해설)만 먼저 테스트해 보시는 것을 추천합니다.
-    # 전체 페이지를 다 돌리려면 specific_pages=None, max_pages_per_file=None 으로 변경하세요.
     if prob_pdf.exists() or sol_pdf.exists():
         vlm_outputs = run_two_file_vlm_test(
             prob_pdf=prob_pdf,
@@ -472,10 +521,12 @@ if __name__ == "__main__":
                 "problem": [1, 8],
                 "solution": [1, 3],
             },
+            render_scale=1.6,
+            overwrite_pngs=True,
+            max_new_tokens=1536,
         )
         print("\n[VLM 테스트 저장 파일 목록]:", vlm_outputs)
 
-        # 추출 결과 일부 미리보기
         for role, json_p in vlm_outputs.items():
             data = json.loads(Path(json_p).read_text(encoding="utf-8"))
             for p_key, p_info in sorted(data.get("pages", {}).items(), key=lambda x: int(x[0])):
