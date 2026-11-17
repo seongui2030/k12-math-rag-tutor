@@ -325,6 +325,28 @@ VSCode에서 Google Colab 커널/런타임에 연결해 실행하기 위한 진�
 \"\"\"
 
 # %%
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_URL = "https://github.com/seongui2030/k12-math-rag-tutor.git"
+COLAB_CLONE_DIR = Path("/content/k12-math-rag-tutor")
+if "google.colab" in sys.modules:
+    from google.colab import drive
+    drive.mount("/content/drive")
+    if not COLAB_CLONE_DIR.exists():
+        subprocess.run(["git", "clone", REPO_URL, str(COLAB_CLONE_DIR)], check=True)
+    os.chdir(COLAB_CLONE_DIR)
+
+_here = Path.cwd().resolve()
+for _candidate in (_here, *_here.parents, Path(__file__).resolve().parents[1]):
+    if (_candidate / "src" / "colab_env.py").is_file():
+        sys.path.insert(0, str(_candidate))
+        break
+else:
+    raise ModuleNotFoundError("Could not find src/colab_env.py in the repository.")
+
 from src.colab_env import is_colab, get_project_root, get_storage_dirs
 
 print("코랩 환경 여부:", is_colab())
