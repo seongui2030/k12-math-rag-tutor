@@ -1,0 +1,15 @@
+pypdf
+pypdfium2
+pillow
+torch
+transformers
+accelerate
+bitsandbytes
+qwen-vl-utils
+sentence-transformers
+faiss-cpu
+langchain-core
+langchain-community
+langchain-text-splitters
+gradio
+pyyaml
