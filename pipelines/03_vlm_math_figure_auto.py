@@ -210,18 +210,32 @@ def run_single_exam_isolated(
         retry_backoff_sec=retry_backoff_sec,
         max_retries=max_retries,
     )
-    proc = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
-    combined_output = f"{proc.stdout}\n{proc.stderr}"
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
 
-    if proc.stdout:
-        print(proc.stdout.rstrip())
-    if proc.stderr:
-        print(proc.stderr.rstrip())
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(project_root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
 
-    if proc.returncode == 0 and not is_quota_exhausted(combined_output):
+    output_lines: list[str] = []
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            output_lines.append(line)
+            print(line, end="", flush=True)
+
+    return_code = proc.wait()
+    combined_output = "".join(output_lines)
+
+    if return_code == 0 and not is_quota_exhausted(combined_output):
         return True, ""
 
-    error_detail = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
+    error_detail = combined_output.strip()[-1000:] or f"exit code {return_code}"
     return False, error_detail
 
 
