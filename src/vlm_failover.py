@@ -12,12 +12,13 @@ from PIL import Image
 
 def load_project_env(env_path: Path | None = None) -> dict[str, str]:
     """
-    Drive 또는 프로젝트 루트의 .env에서 GEMINI_API_KEY, ANTHROPIC_API_KEY를 불러옵니다.
+    Drive 또는 로컬 프로젝트의 .env에서 GEMINI_API_KEY, ANTHROPIC_API_KEY를 불러옵니다.
     """
     candidates = [
         env_path,
         Path("/content/drive/MyDrive/k12_math_rag_data/.env"),
         Path("/content/k12-math-rag-tutor/.env"),
+        Path("D:/k12-math-rag-tutor/.env"),
         Path(".env"),
     ]
     for p in candidates:
@@ -31,10 +32,10 @@ def load_project_env(env_path: Path | None = None) -> dict[str, str]:
     }
 
 
-def is_retryable_or_quota_error(err: Exception | str) -> bool:
+def is_quota_or_transient_error(err: Exception | str) -> bool:
     """
-    503 UNAVAILABLE(과부하) 또는 429 RESOURCE_EXHAUSTED(쿼터 초과) 등
-    Gemini에서 즉시 Claude로 넘겨야 할 오류인지 판별합니다.
+    503 UNAVAILABLE(일시 과부하) 또는 429 RESOURCE_EXHAUSTED(쿼터/요청 한도 초과) 등
+    일시적 오류 또는 쿼터 소진 여부를 판별합니다.
     """
     msg = str(err).upper()
     triggers = [
@@ -48,6 +49,29 @@ def is_retryable_or_quota_error(err: Exception | str) -> bool:
         "OVERLOADED",
     ]
     return any(t in msg for t in triggers)
+
+
+def is_gemini_key_blocked_or_403(err: Exception | str) -> bool:
+    """
+    403 PERMISSION_DENIED 또는 API 키 유출(LEAKED) 등으로 Gemini 키가 차단된 경우를 판별합니다.
+    """
+    msg = str(err).upper()
+    block_triggers = [
+        "403",
+        "PERMISSION_DENIED",
+        "API KEY WAS REPORTED AS LEAKED",
+        "REPORTED AS LEAKED",
+        "API_KEY_INVALID",
+    ]
+    return any(t in msg for t in block_triggers)
+
+
+def should_failover_to_claude(err: Exception | str) -> bool:
+    """
+    503 / 429 뿐만 아니라 403 / PERMISSION_DENIED / LEAKED 발생 시에도
+    Claude로 즉시 페일오버해야 하는지 판별합니다.
+    """
+    return is_quota_or_transient_error(err) or is_gemini_key_blocked_or_403(err)
 
 
 def _image_to_png_bytes_and_b64(image_input: Any) -> tuple[bytes, str]:
@@ -147,8 +171,8 @@ def call_claude_vision(
 
 class VLMFailoverRunner:
     """
-    Gemini를 우선 호출하되, 503/429 발생 시 즉시 Claude로 전환하고
-    이후 호출도 Claude를 우선 사용하도록 상태를 유지할 수 있는 러너입니다.
+    Gemini를 우선 호출하되, 503/429 또는 403/PERMISSION_DENIED/LEAKED 발생 시
+    즉시 Claude로 전환해 파이프라인을 멈추지 않고 이어가도록 돕는 러너입니다.
     """
 
     def __init__(
@@ -156,6 +180,7 @@ class VLMFailoverRunner:
         gemini_model: str = "gemini-2.5-flash",
         claude_model: str = "claude-sonnet-4-5",
         stick_to_claude_on_quota: bool = True,
+        stick_to_claude_on_block: bool = True,
         env_path: Path | None = None,
     ) -> None:
         keys = load_project_env(env_path)
@@ -164,6 +189,7 @@ class VLMFailoverRunner:
         self.gemini_model = gemini_model
         self.claude_model = claude_model
         self.stick_to_claude_on_quota = stick_to_claude_on_quota
+        self.stick_to_claude_on_block = stick_to_claude_on_block
         self.prefer_claude = not bool(self.gemini_key)
 
     def generate(self, prompt: str, image_input: Any, page_label: str = "") -> tuple[str, str]:
@@ -182,13 +208,28 @@ class VLMFailoverRunner:
                 )
                 return text, f"gemini:{self.gemini_model}"
             except Exception as exc:
-                if is_retryable_or_quota_error(exc) and self.claude_key:
+                if should_failover_to_claude(exc) and self.claude_key:
                     err_upper = str(exc).upper()
-                    if self.stick_to_claude_on_quota and ("429" in err_upper or "RESOURCE_EXHAUSTED" in err_upper):
+                    is_blocked = is_gemini_key_blocked_or_403(err_upper)
+                    is_quota = "429" in err_upper or "RESOURCE_EXHAUSTED" in err_upper
+
+                    if is_blocked and self.stick_to_claude_on_block:
                         self.prefer_claude = True
-                        print(f"{prefix}Gemini 429 쿼터 소진 감지 -> 이후 요청도 즉시 Claude({self.claude_model})로 전환합니다.")
+                        print(
+                            f"{prefix}Gemini 403/키 차단 감지(LEAKED/PERMISSION_DENIED) -> "
+                            f"이후 요청도 즉시 Claude({self.claude_model})로 전환합니다."
+                        )
+                    elif is_quota and self.stick_to_claude_on_quota:
+                        self.prefer_claude = True
+                        print(
+                            f"{prefix}Gemini 429 쿼터 초과 감지 -> "
+                            f"이후 요청도 즉시 Claude({self.claude_model})로 전환합니다."
+                        )
                     else:
-                        print(f"{prefix}Gemini 503/429 감지 -> 즉시 Claude({self.claude_model})로 전환합니다.")
+                        print(
+                            f"{prefix}Gemini 503/429/403 감지 -> "
+                            f"즉시 Claude({self.claude_model})로 전환합니다."
+                        )
                 else:
                     raise
 
