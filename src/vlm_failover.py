@@ -243,3 +243,71 @@ class VLMFailoverRunner:
             api_key=self.claude_key,
         )
         return text, f"claude:{self.claude_model}"
+
+    def install_claude_failover_hook(
+    gemini_model: str = "gemini-2.5-flash",
+    claude_model: str = "claude-sonnet-4-5",
+    env_path: Path | None = None,
+) -> VLMFailoverRunner:
+    """
+    google-genai Client.models.generate_content 호출을 가로채어
+    429 / 503 / 403 발생 시 Claude Vision 응답 객체로 즉시 대체합니다.
+    """
+    from types import SimpleNamespace
+    from google import genai
+
+    runner = VLMFailoverRunner(
+        gemini_model=gemini_model,
+        claude_model=claude_model,
+        stick_to_claude_on_quota=True,
+        stick_to_claude_on_block=True,
+        env_path=env_path,
+    )
+
+    models_cls = genai.models.Models
+    if getattr(models_cls, "_claude_failover_patched", False):
+        return runner
+
+    orig_generate_content = models_cls.generate_content
+
+    def _extract_prompt_and_images(contents: Any) -> tuple[str, list[Any]]:
+        prompts: list[str] = []
+        images: list[Any] = []
+        items = contents if isinstance(contents, list) else [contents]
+        for item in items:
+            if isinstance(item, str):
+                prompts.append(item)
+            elif isinstance(item, Image.Image):
+                images.append(item)
+            elif hasattr(item, "inline_data") and getattr(item.inline_data, "data", None):
+                images.append(item.inline_data.data)
+            elif isinstance(item, dict):
+                if "text" in item:
+                    prompts.append(str(item["text"]))
+        return "\n".join(prompts).strip(), images
+
+    def _patched_generate_content(self, *args, **kwargs):
+        try:
+            return orig_generate_content(self, *args, **kwargs)
+        except Exception as exc:
+            if not (should_failover_to_claude(exc) and runner.claude_key):
+                raise
+
+            contents = kwargs.get("contents")
+            if contents is None and len(args) >= 2:
+                contents = args[1]
+
+            prompt, images = _extract_prompt_and_images(contents)
+            if not images:
+                raise
+
+            text, used_backend = runner.generate(
+                prompt=prompt or "이미지의 수식과 내용을 정확히 추출해 주세요.",
+                image_input=images[0],
+                page_label=f"failover:{used_backend if 'used_backend' in locals() else 'claude'}",
+            )
+            return SimpleNamespace(text=text)
+
+    models_cls.generate_content = _patched_generate_content
+    models_cls._claude_failover_patched = True
+    return runner
