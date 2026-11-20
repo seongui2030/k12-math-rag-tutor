@@ -280,7 +280,7 @@ def install_claude_failover_hook(
                 prompts.append(item)
             elif isinstance(item, Image.Image):
                 images.append(item)
-            elif hasattr(item, "inline_data") and getattr(item.inline_data, "data", None):
+            elif hasattr(item, "inline_data") and getattr(getattr(item, "inline_data", None), "data", None):
                 images.append(item.inline_data.data)
             elif isinstance(item, dict) and "text" in item:
                 prompts.append(str(item["text"]))
@@ -293,6 +293,7 @@ def install_claude_failover_hook(
             if not (should_failover_to_claude(exc) and runner.claude_key):
                 raise
 
+            runner.prefer_claude = True
             contents = kwargs.get("contents")
             if contents is None and len(args) >= 2:
                 contents = args[1]
